@@ -1,0 +1,11 @@
+streamlit
+pandas
+openpyxl
+opencv-python
+pillow
+paddleocr
+paddlepaddle
+numpy
+transformers
+torch
+layoutparser

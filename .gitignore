@@ -1,0 +1,42 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# VS Code
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Excel outputs
+output/
+exports/
+*.xlsx
+
+# Model files (if large)
+models/*.pth
+models/*.pt
+
+# Environment variables
+.env
+
+# Temporary uploads
+uploads/
+temp/
