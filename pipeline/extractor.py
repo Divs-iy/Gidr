@@ -1,396 +1,228 @@
-import re
-from turtle import position
-from typing import List, Dict, Optional
-from datetime import datetime
-from unittest import result
-#from unittest import result
-#from pipeline.export.excel_exporter import export_to_excel
-from cv2 import line
-from shapely import buffer
-from utils.excel_exporter import export_to_excel
+# import os
+# import json
+# from typing import Any, Dict
+# from groq import Groq
+# from dotenv import load_dotenv
 
-from shapely import buffer
+# load_dotenv()
 
+# class AIExtractor:
+#     def __init__(self):
+#         api_key = os.getenv("GROQ_API_KEY")
+#         if not api_key:
+#             raise ValueError("GROQ_API_KEY not found in environment")
+#         self.client = Groq(api_key=api_key)
 
-class Extractor:
-    """Robust rule-based field extractor for invoice documents."""
-    
+#     def extract_with_groq(self, extracted_data: Any) -> Dict:
+#         try:
+#             if isinstance(extracted_data, dict):
+#                 raw_text = extracted_data.get("raw_text", "")
+#             elif isinstance(extracted_data, list):
+#                 raw_text = "\n".join([item.get('text', '') for item in extracted_data])
+#             else:
+#                 raw_text = str(extracted_data)
+
+#             # ✅ Hard cap the text to avoid token bloat and slowness
+#             raw_text = raw_text[:4000]
+
+#             prompt = f"""You are a document data extractor. Extract billing data from the OCR text below.
+
+# RULES:
+# 1. Only extract data that is EXPLICITLY present in the OCR text. Do NOT guess or invent values.
+# 2. DOCUMENT TYPE: If the text contains words like "Premium", "Policy", "Insurance", "CGST", "SGST" — it is INSURANCE. Otherwise it is INVOICE.
+# 3. INSURANCE documents: line_items must contain ONLY rows like Net Premium, CGST, SGST, IGST, Stamp Duty. Nothing else.
+# 4. INVOICE documents: line_items must contain product/service rows only.
+# 5. vendor_name = the company issuing the bill (top of document, not broker or agent).
+# 6. total_amount = the final grand total number only.
+# 7. date format = YYYY-MM-DD. If unclear, use "".
+# 8. confidence_score = how confident you are based on text clarity (0.0 to 1.0).
+# 9. If a field is not found in the text, use "" for strings and 0.0 for numbers.
+# 10. Return ONLY a JSON object. No explanation, no markdown.
+
+# OUTPUT FORMAT:
+# {{
+#     "document_type": "",
+#     "invoice_number": "",
+#     "vendor_name": "",
+#     "buyer_name": "",
+#     "date": "",
+#     "gstin": "",
+#     "currency": "INR",
+#     "subtotal_amount": 0.0,
+#     "tax_amount": 0.0,
+#     "total_amount": 0.0,
+#     "line_items": [
+#         {{"description": "", "quantity": 1, "unit_price": 0.0, "amount": 0.0}}
+#     ],
+#     "confidence_score": 0.0
+# }}
+
+# OCR TEXT:
+# {raw_text}"""
+
+#             response = self.client.chat.completions.create(
+#                 messages=[{"role": "user", "content": prompt}],
+#                 model="llama-3.1-8b-instant",   # ✅ 8b is 10x faster than 70b, accurate enough
+#                 temperature=0.0,
+#                 response_format={"type": "json_object"},
+#                 max_tokens=1000                  # ✅ cap output tokens — stops runaway responses
+#             )
+
+#             content = response.choices[0].message.content
+#             return json.loads(content)
+
+#         except Exception as e:
+#             print(f"Extraction Error: {e}")
+#             return {
+#                 "invoice_number": "ERROR",
+#                 "vendor_name": "Could not extract",
+#                 "date": "",
+#                 "gstin": "",
+#                 "total_amount": 0.0,
+#                 "tax_amount": 0.0,
+#                 "line_items": [],
+#                 "confidence_score": 0.0
+#             }
+
+import os
+import json
+import base64
+from typing import Any, Dict
+from groq import Groq
+from dotenv import load_dotenv
+
+load_dotenv()
+
+class AIExtractor:
     def __init__(self):
-        # Define field patterns with variations
-        self.field_patterns = {
-            'invoice_number': [
-                r'invoice\s*(?:no|number|#|num)?[\s:]*([A-Z0-9\-/]+)',
-                r'inv\s*(?:no|number|#)?[\s:]*([A-Z0-9\-/]+)',
-                r'bill\s*(?:no|number|#)?[\s:]*([A-Z0-9\-/]+)',
-                r'(?:^|\|)\s*([A-Z0-9]{4,}\-[0-9]+)',
-            ],
-            'invoice_date': [
-                r'invoice\s*date[\s:]*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})',
-                r'inv\s*date[\s:]*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})',
-                r'date\s*of\s*invoice[\s:]*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})',
-                r'bill\s*date[\s:]*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})',
-                r'dated?[\s:]*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})',
-            ],
-            'due_date': [
-                r'due\s*date[\s:]*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})',
-                r'payment\s*due[\s:]*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})',
-                r'pay\s*by[\s:]*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})',
-                r'due\s*on[\s:]*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})',
-                r'payable\s*by[\s:]*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})',
-            ],
-            'total': [
-                r'total[\s:]*[£$€]?\s*([\d,]+\.?\d{0,2})',
-                r'amount\s*due[\s:]*[£$€]?\s*([\d,]+\.?\d{0,2})',
-                r'grand\s*total[\s:]*[£$€]?\s*([\d,]+\.?\d{0,2})',
-                r'balance\s*due[\s:]*[£$€]?\s*([\d,]+\.?\d{0,2})',
-                r'total\s*amount[\s:]*[£$€]?\s*([\d,]+\.?\d{0,2})',
-                r'net\s*total[\s:]*[£$€]?\s*([\d,]+\.?\d{0,2})',
-            ]
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            raise ValueError("GROQ_API_KEY not found in environment")
+        self.client = Groq(api_key=api_key)
+
+    def _build_prompt(self) -> str:
+        return """You are a document data extractor. Extract billing data from this document image.
+
+STEP 1 — IDENTIFY DOCUMENT TYPE:
+- If you see "Premium", "Policy", "Insurance", "CGST", "SGST" → type is "INSURANCE"
+- If you see section headers like "Section A", "Section B", SR.NO column, BOQ, WKR, project codes → type is "BOQ_INVOICE"
+- Everything else → type is "INVOICE"
+
+STEP 2 — EXTRACT BASED ON TYPE:
+
+IF INSURANCE:
+- line_items: ONLY rows like Net Premium, CGST, SGST, IGST, Stamp Duty
+- vendor_name: insurance company name
+- total_amount: final premium payable
+
+IF BOQ_INVOICE (construction/plumbing/electrical works):
+- vendor_name: company name with stamp/letterhead (e.g. "Suryam Developers LLP")
+- buyer_name: project name or client name from header
+- - invoice_number: the actual invoice number or bill number (e.g. "INV-001", "2024-156"). If no invoice number exists, use "".
+- date: from header (format YYYY-MM-DD)
+- total_amount: GRAND TOTAL only (sum of all sections), NOT a section subtotal
+- line_items: one row per SR.NO entry that has an amount. Rules:
+    * description: SHORT name max 5 words (e.g. "Wall Hung WC", "CP Brass Faucet", "Concealed Cistern")
+    * unit: extract unit as-is (No., Rmt., Set, etc.)
+    * quantity: number from Qty. column
+    * unit_price: number from Rate column
+    * amount: number from Amount column
+    * SKIP rows with no amount, header rows, note rows, and section total rows
+    * SKIP rows that are just notes or conditions (lines starting with #)
+
+IF INVOICE:
+- line_items: product/service rows only, short description max 6 words
+- vendor_name: company issuing the bill
+- total_amount: final grand total
+
+GLOBAL RULES:
+- Only extract data EXPLICITLY visible. Do NOT guess or invent values.
+- date format = YYYY-MM-DD. If unclear, use "".
+- confidence_score = clarity of the image (0.0 to 1.0)
+- If a field is not found: use "" for strings, 0.0 for numbers
+- Return ONLY a JSON object. No explanation, no markdown, no code fences.
+
+OUTPUT FORMAT:
+{
+    "document_type": "",
+    "invoice_number": "",
+    "vendor_name": "",
+    "buyer_name": "",
+    "date": "",
+    "gstin": "",
+    "currency": "INR",
+    "subtotal_amount": 0.0,
+    "tax_amount": 0.0,
+    "total_amount": 0.0,
+    "line_items": [
+        {
+            "description": "",
+            "unit": "",
+            "quantity": 1,
+            "unit_price": 0.0,
+            "amount": 0.0
         }
-    
-    def clean_text(self, text: str) -> str:
-        """Clean OCR noise and normalize text."""
-        if not text:
-            return ""
-        
-        # Common OCR corrections
-        ocr_fixes = {
-            'lnvoice': 'Invoice',
-            'Pertect': 'Perfect',
-            'bes': 'Pipes',
-            'Plumbling': 'Plumbing',
-            'Emall': 'Email',
-        }
-        
-        cleaned = text
-        for wrong, right in ocr_fixes.items():
-            cleaned = re.sub(wrong, right, cleaned, flags=re.IGNORECASE)
-        
-        return cleaned.strip()
-    
-    def normalize_amount(self, amount_str: str) -> Optional[float]:
-        """Convert amount string to float, handling various formats."""
-        if not amount_str:
-            return None
-        
+    ],
+    "confidence_score": 0.0
+}"""
+
+    def extract_with_groq(self, ocr_data: Any) -> Dict:
         try:
-            # Remove currency symbols and commas
-            clean_amount = re.sub(r'[£$€,\s]', '', amount_str)
-            return float(clean_amount)
-        except (ValueError, TypeError):
-            return None
-    
-    def normalize_date(self, date_str: str) -> Optional[str]:
-        """Normalize date to DD/MM/YYYY format."""
-        if not date_str:
-            return None
-        
-        # Common date formats
-        date_formats = [
-            '%d/%m/%Y', '%d-%m-%Y', '%d.%m.%Y',
-            '%d/%m/%y', '%d-%m-%y', '%d.%m.%y',
-            '%Y/%m/%d', '%Y-%m-%d',
-            '%m/%d/%Y', '%m-%d-%Y',
-        ]
-        
-        for fmt in date_formats:
-            try:
-                dt = datetime.strptime(date_str.strip(), fmt)
-                return dt.strftime('%d/%m/%Y')
-            except ValueError:
-                continue
-        
-        return date_str  # Return as-is if can't parse
-    
-    def extract_field_from_lines(self, lines: List[str], patterns: List[str], 
-                                  normalize_func=None) -> Optional[str]:
-        """
-        Extract a field using multiple regex patterns.
-        Returns the first confident match.
-        """
-        best_match = None
-        best_confidence = 0.0
-        
-        for line_idx, line in enumerate(lines):
-            cleaned_line = self.clean_text(line)
-            
-            for pattern_idx, pattern in enumerate(patterns):
-                match = re.search(pattern, cleaned_line, re.IGNORECASE)
-                
-                if match:
-                    value = match.group(1).strip()
-                    
-                    # Calculate confidence
-                    confidence = 1.0
-                    
-                    # Pattern priority (earlier patterns are more specific)
-                    confidence -= pattern_idx * 0.1
-                    
-                    # Position bonus (earlier lines for header fields)
-                    if line_idx < 5:
-                        confidence += 0.2
-                    
-                    # Update best match if better confidence
-                    if confidence > best_confidence:
-                        best_confidence = confidence
-                        best_match = value
-        
-        if best_match and normalize_func:
-            return normalize_func(best_match)
-        
-        return best_match
-    
-    def extract_fields(self, lines_data: List) -> Dict[str, Optional[str]]:
-        """
-        Main extraction function.
-        
-        Args:
-            lines_data: List of lines from LayoutParser (list of dicts with 'text' key)
-                       OR list of strings
-            
-        Returns:
-            Dictionary with extracted fields
-        """
-        # Convert to list of strings if needed
-        if not lines_data:
-            return {
-                'invoice_number': None,
-                'invoice_date': None,
-                'due_date': None,
-                'total': None
-            }
-        
-        # Handle both formats: list of dicts OR list of strings
-        if isinstance(lines_data[0], dict):
-            # Convert list of line groups to text strings
-            text_lines = []
-            for line_group in lines_data:
-                if isinstance(line_group, list):
-                    # It's a list of items (from layout parser)
-                    text = " | ".join([item.get('text', '') for item in line_group])
-                    text_lines.append(text)
-                else:
-                    # It's already a dict with text
-                    text_lines.append(line_group.get('text', ''))
-        else:
-            # Already strings
-            text_lines = lines_data
-        
-        # Extract invoice number
-        invoice_number = self.extract_field_from_lines(
-            text_lines, 
-            self.field_patterns['invoice_number']
-        )
-        if invoice_number:
-            invoice_number = re.sub(r'[:|]+$', '', invoice_number.upper().strip())
-        
-        # Extract invoice date
-        invoice_date = self.extract_field_from_lines(
-            text_lines, 
-            self.field_patterns['invoice_date'],
-            self.normalize_date
-        )
-        
-        # Extract due date
-        due_date = self.extract_field_from_lines(
-            text_lines, 
-            self.field_patterns['due_date'],
-            self.normalize_date
-        )
-        
-        # Extract total
-        total_str = self.extract_field_from_lines(
-            text_lines, 
-            self.field_patterns['total'] 
+            images_b64 = []
 
-        )
-        if not total_str:
-            for line in reversed(text_lines):
-                match = re.search(r'(\d{1,3}(?:,\d{3})*\.\d{2})', line)
-                if match:
-                    total_str = match.group()
-                    break
-
-        total_value = self.normalize_amount(total_str) if total_str else None
-
-# find line where total came from
-        total_line = None
-        for i, line in enumerate(text_lines):
-            if total_str and total_str in line:
-                total_line = line
-                total_pos = i
-                break
-
-        total = {
-    "value": total_value,
-    "confidence": self.compute_confidence(
-        total_value,
-        total_line,
-        total_pos if total_line else 0,
-        len(text_lines)
-    )
-}
-        table = self.extract_table(text_lines)
-
-        result = {
-            'invoice_number': invoice_number,
-            'invoice_date': invoice_date,
-            'due_date': due_date,
-            'total': total,
-            'items': table
-            }
-
-        return result
-    # if __name__ == "__main__":
-    #     extractor = Extractor()
-    
-    #result = extractor.process("data/raw/invoice11.jpeg")  # your method name
-    #extracted_data = extractor.extract_fields(lines_data)
-
-    #export_to_excel(extracted_data)
-    #from pipeline.export.excel_exporter import export_to_excel
-    #export_to_excel(result, "data/output/invoice_output.xlsx")
-    # def find_table_start(self, lines):
-    #     for i, line in enumerate(lines):
-    #         l = line.lower()
-    #         if all(k in l for k in ["description", "quantity", "price"]):
-    #             return i
-    #     return -1
-    def merge_multiline_rows(self, lines):
-        merged = []
-        buffer = ""
-
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-
-        # If line starts lowercase or is continuation → merge
-            if buffer and line[0].islower() :
-                buffer += " " + line
+            if isinstance(ocr_data, dict):
+                images_b64 = ocr_data.get("images_b64", [])
+                raw_text = ocr_data.get("raw_text", "")
+            elif isinstance(ocr_data, list):
+                raw_text = "\n".join([item.get('text', '') for item in ocr_data])
             else:
-                if buffer:
-                    merged.append(buffer)
-                buffer = line
+                raw_text = str(ocr_data)
 
-        if buffer:
-            merged.append(buffer)
+            # ✅ Vision path — send image directly to Groq (fast, accurate, no local OCR)
+            if images_b64:
+                # Only send first 2 pages max to keep it fast
+                pages_to_send = images_b64[:2]
 
-        return merged
+                content = [{"type": "text", "text": self._build_prompt()}]
+                for img_b64 in pages_to_send:
+                    content.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{img_b64}"
+                        }
+                    })
 
-    def extract_table(self, lines):
-        import re
-        table = []
-        start = -1
+                response = self.client.chat.completions.create(
+                    messages=[{"role": "user", "content": content}],
+                    model="meta-llama/llama-4-scout-17b-16e-instruct",  # ✅ Groq vision model
+                    temperature=0.0,
+                    response_format={"type": "json_object"},
+                    max_tokens=1000
+                )
 
-    # find header
-        for i, line in enumerate(lines):
-            l = line.lower()
-            if "description" in l and ("amount" in l or "price" in l):
-                start = i
-                break
-            if start == -1:
-                for i, line in enumerate(lines):
-                    if re.search(r'\d+\.\d{2}', line) and len(line.split()) > 3:
-                        start = i - 1
-                        break
+            # ✅ Text fallback path (if somehow only raw_text is available)
+            else:
+                raw_text = raw_text[:4000]
+                response = self.client.chat.completions.create(
+                    messages=[{"role": "user", "content": self._build_prompt() + f"\n\nOCR TEXT:\n{raw_text}"}],
+                    model="llama-3.1-8b-instant",
+                    temperature=0.0,
+                    response_format={"type": "json_object"},
+                    max_tokens=1000
+                )
 
-        # if start == -1:
-        #     return table
-        print("TABLE START INDEX:", start)
+            content = response.choices[0].message.content
+            return json.loads(content)
 
-    # process rows
-        lines = self.merge_multiline_rows(lines)
-        current_item = None
-        for line in lines[start + 1:]:
-
-            l = line.lower().strip()
-
-        # stop at totals
-            if any(k in l for k in ["subtotal", "amount due"]):
-                break
-            if "amount paid" in l:
-                continue
-
-# skip unwanted rows
-            # if "vat" in l or "amount paid" in l:
-            #     continue
-
-            numbers = re.findall(r'-?\d+\.\d{2}', line)
-            vat_match= re.search(r'(\d+%)', line)
-
-            try:
-                if "discount" in l:
-                    amount = float(numbers[-1]) if numbers else 0.0
-                    if current_item:
-                        table.append(current_item)
-                        current_item = None
-                    table.append({
-                        "description": "Discount",
-                        "quantity": None,
-                        "unit_price": None,
-                        "vat": None,
-                        "amount": -abs(amount)
-                })
-                elif len(numbers) >= 2:
-                    if current_item:
-                        table.append(current_item)
-                    description = line
-
-    # remove price values
-                    description = re.sub(r'-?\d+\.\d{2}', '', description)
-
-    # remove percentages (VAT like 20%)
-                    description = re.sub(r'\d+%', '', description)
-
-    # remove quantity patterns like "1 each", "2 qty", "3 x"
-                    description = re.sub(r'\b\d+\s*(each|qty|x)?\b', '', description, flags=re.IGNORECASE)
-
-    # clean extra spaces
-                    description = re.sub(r'\s+', ' ', description).strip()
-                    current_item = {
-                    "description": description,
-                    "quantity": 1,
-                    "unit_price": float(numbers[-2]),
-                    "vat": vat_match.group() if vat_match else None,
-                    "amount": float(numbers[-1])
-                }
-                elif len(numbers) == 0:
-                    if current_item:
-                        current_item["description"] += " " + l
-
-            except:
-                continue
-        if current_item:
-            table.append(current_item)
-        return table
-    def compute_confidence(self, value, line, position, total_lines):
-        import re
-
-        score = 0
-
-        if value:
-            score += 0.4
-
-        if line and any(k in line.lower() for k in ["total", "invoice", "date"]):
-            score += 0.3
-
-        if line and re.search(r'\d', line):
-            score += 0.2
-
-        if position > total_lines * 0.6:
-            score += 0.1
-
-        return round(min(score, 1.0), 2)
-        
-
-                    # table.append({
-                    #      "description": description,
-                    #      "quantity": 1,
-                    #      "unit_price": float(numbers[0]),
-                    #      "amount": float(numbers[-1])
-                    # })  #mmmmmmm
-            # append last item
-    
-    
-    #clean_lines = list(dict.fromkeys(clean_lines))
+        except Exception as e:
+            print(f"Extraction Error: {e}")
+            return {
+                "invoice_number": "ERROR",
+                "vendor_name": "Could not extract",
+                "date": "",
+                "gstin": "",
+                "total_amount": 0.0,
+                "tax_amount": 0.0,
+                "line_items": [],
+                "confidence_score": 0.0
+            }
