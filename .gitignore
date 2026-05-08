@@ -40,3 +40,14 @@ models/*.pt
 # Temporary uploads
 uploads/
 temp/
+
+.venv/
+__pycache__/
+*.pyc
+.env
+*.db
+data/raw/
+data/raw_archive/
+data/processed/
+data/exports/
+migrate.py
