@@ -56,8 +56,7 @@ app.mount("/downloads", StaticFiles(directory="data/exports"), name="downloads")
 # main.py — add this line after the other app.mount lines
 os.makedirs("data/raw_archive", exist_ok=True)
 app.mount("/originals", StaticFiles(directory="data/raw_archive"), name="originals")
-app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:3000"],
-    allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_credentials=True, allow_methods=["*"], allow_origins=["*"], allow_headers=["*"])
 
 ocr_engine = OCRProcessor()
 extractor_engine = AIExtractor()
@@ -189,11 +188,11 @@ async def upload_invoice(
             })
         if not rows:
             rows.append({"Note": "No line items found", **extracted})
-
+        BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "http://localhost:8000")
         file_name = f"invoice_{extracted.get('invoice_number', 'unknown')}_{datetime.now().strftime('%H%M%S')}.xlsx"
         web_export_path = os.path.join("data", "exports", file_name)
         pd.DataFrame(rows).to_excel(web_export_path, index=False)
-        download_url = f"http://localhost:8000/downloads/{file_name}"
+        download_url = f"{BASE_URL}/downloads/{file_name}"
 
         # ✅ Only save to DB if real extraction — quotes are temp files only
         if source == "extraction":
