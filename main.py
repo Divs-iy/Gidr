@@ -185,6 +185,7 @@ async def upload_invoice(
                 "Unit Price": item.get("unit_price"),
                 "Line Amount": item.get("amount"),
                 "Total Bill": extracted.get("total_amount"),
+                "Terms & Conditions": extracted.get("terms_and_conditions", ""),
             })
         if not rows:
             rows.append({"Note": "No line items found", **extracted})
@@ -205,6 +206,7 @@ async def upload_invoice(
                 confidence_score=extracted.get("confidence_score", None),
                 user_id=current_user_id,
                 original_filename=file.filename,
+                terms_and_conditions=extracted.get("terms_and_conditions", ""),
             )
             db.add(new_record)
             db.flush()
@@ -324,8 +326,8 @@ async def compare_docs(
             os.remove(temp_invoice)
 
 @app.put("/invoices/{invoice_id}")
-async def update_invoice(invoice_id: int, updated_data: dict = Body(...), db: Session = Depends(get_db)):
-    invoice = db.query(InvoiceRecord).filter(InvoiceRecord.id == invoice_id).first()
+async def update_invoice(invoice_id: int, updated_data: dict = Body(...), db: Session = Depends(get_db), current_user_id: int = Depends(get_current_user)):
+    invoice = db.query(InvoiceRecord).filter(InvoiceRecord.id == invoice_id, InvoiceRecord.user_id == current_user_id).first()
     if not invoice:
         raise HTTPException(status_code=404, detail="Invoice not found")
     invoice.vendor_name = updated_data.get("vendor_name", invoice.vendor_name)
@@ -336,8 +338,8 @@ async def update_invoice(invoice_id: int, updated_data: dict = Body(...), db: Se
 
 
 @app.delete("/invoices/{invoice_id}")
-async def delete_invoice(invoice_id: int, db: Session = Depends(get_db)):
-    invoice = db.query(InvoiceRecord).filter(InvoiceRecord.id == invoice_id).first()
+async def delete_invoice(invoice_id: int, db: Session = Depends(get_db), current_user_id: int = Depends(get_current_user)):
+    invoice = db.query(InvoiceRecord).filter(InvoiceRecord.id == invoice_id, InvoiceRecord.user_id == current_user_id).first()
     if not invoice:
         raise HTTPException(status_code=404, detail="Invoice not found")
     db.delete(invoice)
@@ -376,8 +378,8 @@ async def get_history(
 
 
 @app.get("/export-all")
-async def export_all(db: Session = Depends(get_db)):
-    invoices = db.query(InvoiceRecord).all()
+async def export_all(db: Session = Depends(get_db), current_user_id: int = Depends(get_current_user)):
+    invoices = db.query(InvoiceRecord).filter(InvoiceRecord.user_id == current_user_id).all()
     all_data = []
     for inv in invoices:
         for item in inv.items:

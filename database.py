@@ -30,10 +30,10 @@ class InvoiceRecord(Base):
     user_id = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     excel_link = Column(String, nullable=True) 
+    original_filename = Column(String, nullable=True)  # ✅ ADD THIS
+    terms_and_conditions = Column(String, nullable=True)
     items = relationship("LineItem", back_populates="invoice", cascade="all, delete-orphan")
     # database.py — add one line inside InvoiceRecord class
-    original_filename = Column(String, nullable=True)  # ✅ ADD THIS
-
 class LineItem(Base):
     __tablename__ = "line_items"
 

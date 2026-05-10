@@ -21,6 +21,12 @@ try:
 except Exception as e:
     print(f"⚠️  line_items.unit: {e}")
 
+try:
+    cursor.execute("ALTER TABLE invoices ADD COLUMN terms_and_conditions TEXT")
+    print("✅ Added terms_and_conditions")
+except Exception as e:
+    print(f"⚠️ {e}")
+
 conn.commit()
 conn.close()
 print("✅ Migration complete")

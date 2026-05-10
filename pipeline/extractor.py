@@ -112,15 +112,16 @@ STEP 2 — EXTRACT BASED ON TYPE:
 
 IF INSURANCE:
 - line_items: ONLY rows like Net Premium, CGST, SGST, IGST, Stamp Duty
-- vendor_name: insurance company name
+- vendor_name: insurance company name (not broker or agent)
 - total_amount: final premium payable
+- terms_and_conditions: key policy conditions in max 2 sentences
 
 IF BOQ_INVOICE (construction/plumbing/electrical works):
 - vendor_name: company name with stamp/letterhead (e.g. "Suryam Developers LLP")
 - buyer_name: project name or client name from header
-- - invoice_number: the actual invoice number or bill number (e.g. "INV-001", "2024-156"). If no invoice number exists, use "".
+- invoice_number: the actual invoice number or bill number (e.g. "INV-001", "2024-156"). If no invoice number exists, use "".
 - date: from header (format YYYY-MM-DD)
-- total_amount: GRAND TOTAL only (sum of all sections), NOT a section subtotal
+- total_amount: GRAND TOTAL of ALL sections combined. Look for a SUMMARY or GRAND TOTAL row at the very end of the document, NOT a section subtotal like "Total of Section A". If the document has sections A, B, C — add all section totals together. Never use a single section total.
 - line_items: one row per SR.NO entry that has an amount. Rules:
     * description: SHORT name max 5 words (e.g. "Wall Hung WC", "CP Brass Faucet", "Concealed Cistern")
     * unit: extract unit as-is (No., Rmt., Set, etc.)
@@ -129,11 +130,18 @@ IF BOQ_INVOICE (construction/plumbing/electrical works):
     * amount: number from Amount column
     * SKIP rows with no amount, header rows, note rows, and section total rows
     * SKIP rows that are just notes or conditions (lines starting with #)
+- terms_and_conditions: extract ONLY the most important conditions, max 3 bullet points covering:
+    * payment or rate inclusions (e.g. "Rates include labour, materials and transportation")
+    * scope exclusions (e.g. "Electrical work not included")
+    * key quality/compliance notes (e.g. "All fixtures as per IGBC guidelines")
+    Format as plain text, no bullet symbols, separated by " | "
 
 IF INVOICE:
-- line_items: product/service rows only, short description max 6 words
 - vendor_name: company issuing the bill
+- invoice_number: invoice/bill number
+- line_items: product/service rows, description max 6 words
 - total_amount: final grand total
+- terms_and_conditions: payment terms and key conditions, max 2 sentences
 
 GLOBAL RULES:
 - Only extract data EXPLICITLY visible. Do NOT guess or invent values.
@@ -154,6 +162,7 @@ OUTPUT FORMAT:
     "subtotal_amount": 0.0,
     "tax_amount": 0.0,
     "total_amount": 0.0,
+    "terms_and_conditions": "",
     "line_items": [
         {
             "description": "",
@@ -224,5 +233,6 @@ OUTPUT FORMAT:
                 "total_amount": 0.0,
                 "tax_amount": 0.0,
                 "line_items": [],
+                "terms_and_conditions": "",
                 "confidence_score": 0.0
             }
