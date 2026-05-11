@@ -19,7 +19,11 @@ from concurrent.futures import ThreadPoolExecutor
 from pipeline.ocr import OCRProcessor
 from pipeline.extractor import AIExtractor
 from fastapi import Header
-
+from fastapi.responses import FileResponse
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+from database import AuditReport, AuditItem
 # --- PATCH START ---
 import bcrypt
 # Passlib looks for __about__, so we give it what it wants
@@ -250,7 +254,6 @@ async def compare_docs(
     invoice: UploadFile = File(...),
     quote_filename: str = Query(...)
 ):
-    # ✅ Load quote JSON — already extracted at upload time
     quote_path = f"data/processed/{quote_filename}.json"
     if not os.path.exists(quote_path):
         raise HTTPException(status_code=404, detail="Quote not found. Upload quote first.")
@@ -258,7 +261,6 @@ async def compare_docs(
     with open(quote_path, "r") as f:
         quote_data = json.load(f)
 
-    # ✅ Save the invoice file temporarily
     temp_invoice = f"data/raw/{invoice.filename}"
     os.makedirs("data/raw", exist_ok=True)
 
@@ -266,25 +268,26 @@ async def compare_docs(
         with open(temp_invoice, "wb") as buffer:
             shutil.copyfileobj(invoice.file, buffer)
 
-        # ✅ Check if this invoice was already extracted (uploaded before)
         invoice_base = os.path.splitext(invoice.filename)[0]
         invoice_json_path = f"data/processed/{invoice_base}.json"
 
         if os.path.exists(invoice_json_path):
-            # ✅ Already extracted — just load the JSON, zero OCR cost
             with open(invoice_json_path, "r") as f:
                 invoice_data = json.load(f)
+            logger.info(f"Using cached invoice JSON: {invoice_json_path}")
         else:
-            # ✅ Not seen before — OCR + extract once, then save for reuse
-            ocr_result = ocr_engine.run_ocr(temp_invoice)
-            invoice_data = extractor_engine.extract_with_groq(ocr_result)
+            loop = asyncio.get_event_loop()
+            def run_compare_pipeline():
+                ocr_result = ocr_engine.run_ocr(temp_invoice)
+                return extractor_engine.extract_with_groq(ocr_result)
+            invoice_data = await loop.run_in_executor(executor, run_compare_pipeline)
             save_processed_json(invoice_base, invoice_data)
 
-        # ✅ Pure JSON comparison — no OCR, just math
         discrepancies = []
 
-        q_amt = float(quote_data.get('total_amount', 0))
-        i_amt = float(invoice_data.get('total_amount', 0))
+        # Total amount check
+        q_amt = round(float(quote_data.get('total_amount') or 0), 2)
+        i_amt = round(float(invoice_data.get('total_amount') or 0), 2)
         if abs(q_amt - i_amt) > 0.01:
             discrepancies.append({
                 "field": "Total Amount",
@@ -293,26 +296,29 @@ async def compare_docs(
                 "diff": round(i_amt - q_amt, 2)
             })
 
-        # ✅ Also compare line items if both have them
-        q_items = {item['description']: item['amount'] for item in quote_data.get('line_items', [])}
-        i_items = {item['description']: item['amount'] for item in invoice_data.get('line_items', [])}
+        # Line item check — match by rounded amount only
+        q_items_list = quote_data.get('line_items', [])
+        i_items_list = invoice_data.get('line_items', [])
 
-        for desc, q_val in q_items.items():
-            i_val = i_items.get(desc)
-            if i_val is None:
+        # Build invoice amount lookup
+        i_amounts = {}
+        for item in i_items_list:
+            key = round(float(item.get('amount') or 0), 2)
+            i_amounts[key] = item
+
+        for q_item in q_items_list:
+            q_val = round(float(q_item.get('amount') or 0), 2)
+            q_desc = q_item.get('description', 'Item')[:50]
+            if q_val == 0:
+                continue
+            if q_val not in i_amounts:
                 discrepancies.append({
-                    "field": f"Item '{desc}'",
+                    "field": f"'{q_desc}'",
                     "quote": q_val,
                     "invoice": "MISSING",
                     "diff": q_val
                 })
-            elif abs(float(q_val) - float(i_val)) > 0.01:
-                discrepancies.append({
-                    "field": f"Item '{desc}'",
-                    "quote": q_val,
-                    "invoice": i_val,
-                    "diff": round(float(i_val) - float(q_val), 2)
-                })
+            # amount matched — no discrepancy, skip
 
         return {
             "status": "MISMATCH" if discrepancies else "MATCH",
@@ -369,9 +375,15 @@ async def get_history(
             "filename": inv.original_filename or inv.invoice_number,
             "excel_link": inv.excel_link,
             "items": [
-                {"id": item.id, "description": item.description, "unit": item.unit,"amount": item.amount}
-                for item in inv.items
-            ]
+    {
+        "id": item.id,
+        "description": item.description,
+        "unit": item.unit,
+        "quantity": item.quantity,
+        "amount": item.amount
+    }
+    for item in inv.items
+]
         }
         for inv in invoices
     ]
@@ -394,6 +406,221 @@ async def export_all(db: Session = Depends(get_db), current_user_id: int = Depen
     master_path = os.path.expanduser("~/Desktop/Gidr_Exports/Master_Report.xlsx")
     pd.DataFrame(all_data).to_excel(master_path, index=False)
     return {"status": "success", "path": master_path}
+
+def generate_audit_reason(status: str, quoted: float, invoiced: float, desc: str) -> str:
+    if status == "MATCH":
+        return "Price matches quotation exactly."
+    elif status == "PRICE MISMATCH":
+        diff = round(invoiced - quoted, 2)
+        if diff > 0:
+            return f"Invoiced price is ₹{diff} higher than quoted price."
+        else:
+            return f"Invoiced price is ₹{abs(diff)} lower than quoted price."
+    elif status == "NOT IN QUOTE":
+        return "Item was never approved in the initial quotation."
+    elif status == "MISSING IN INVOICE":
+        return "Item present in quote but missing from invoice."
+    return ""
+
+@app.post("/audit/save")
+async def save_audit(
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    current_user_id: int = Depends(get_current_user)
+):
+
+    # Delete previous audit for same quote+invoice combo
+    existing = db.query(AuditReport).filter(
+        AuditReport.user_id == current_user_id,
+        AuditReport.quote_filename == payload.get("quote_filename"),
+        AuditReport.invoice_filename == payload.get("invoice_filename")
+    ).first()
+    if existing:
+        db.delete(existing)
+        db.flush()
+
+    report = AuditReport(
+        user_id=current_user_id,
+        quote_filename=payload.get("quote_filename"),
+        invoice_filename=payload.get("invoice_filename")
+    )
+    db.add(report)
+    db.flush()
+
+    for item in payload.get("items", []):
+        db.add(AuditItem(
+            report_id=report.id,
+            description=item.get("description"),
+            quoted_price=item.get("quoted_price", 0),
+            invoiced_price=item.get("invoiced_price", 0),
+            status=item.get("status"),
+            reason=item.get("reason"),
+            action=item.get("action", "FLAGGED"),
+            comment=item.get("comment", "")
+        ))
+    db.commit()
+    return {"status": "success", "report_id": report.id}
+
+
+@app.get("/audit/report/{report_id}")
+async def download_audit_report(
+    report_id: int,
+    db: Session = Depends(get_db),
+    current_user_id: int = Depends(get_current_user)
+):
+    from database import AuditReport, AuditItem
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    report = db.query(AuditReport).filter(
+        AuditReport.id == report_id,
+        AuditReport.user_id == current_user_id
+    ).first()
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Audit Report"
+
+    # Styles
+    header_font = Font(name="Arial", bold=True, color="FFFFFF", size=11)
+    header_fill = PatternFill("solid", start_color="1F2D3D")
+    red_fill = PatternFill("solid", start_color="FFCCCC")
+    green_fill = PatternFill("solid", start_color="CCFFCC")
+    yellow_fill = PatternFill("solid", start_color="FFFACC")
+    grey_fill = PatternFill("solid", start_color="F0F0F0")
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    left = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    thin = Border(
+        left=Side(style="thin"), right=Side(style="thin"),
+        top=Side(style="thin"), bottom=Side(style="thin")
+    )
+
+    # Title row
+    ws.merge_cells("A1:G1")
+    ws["A1"] = "GIDR — VENDOR AUDIT REPORT"
+    ws["A1"].font = Font(name="Arial", bold=True, size=14, color="FFFFFF")
+    ws["A1"].fill = PatternFill("solid", start_color="1F2D3D")
+    ws["A1"].alignment = center
+    ws.row_dimensions[1].height = 30
+
+    # Meta row
+    ws.merge_cells("A2:G2")
+    ws["A2"] = f"Quote: {report.quote_filename}   |   Invoice: {report.invoice_filename}   |   Generated: {report.created_at.strftime('%Y-%m-%d %H:%M')}"
+    ws["A2"].font = Font(name="Arial", size=9, italic=True)
+    ws["A2"].fill = grey_fill
+    ws["A2"].alignment = left
+    ws.row_dimensions[2].height = 18
+
+    # Headers
+    headers = ["Item Description", "Quoted Price (₹)", "Invoiced Price (₹)", "Status", "Reason", "Action", "Accountant Note"]
+    for col, h in enumerate(headers, 1):
+        cell = ws.cell(row=3, column=col, value=h)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = center
+        cell.border = thin
+    ws.row_dimensions[3].height = 22
+
+    # Data rows
+    for row_idx, item in enumerate(report.items, start=4):
+        values = [
+            item.description,
+            item.quoted_price,
+            item.invoiced_price,
+            item.status,
+            item.reason,
+            item.action,
+            item.comment or ""
+        ]
+        # Pick row fill based on action + status
+        if item.status == "MATCH":
+            row_fill = green_fill
+        elif item.action == "APPROVED":
+            row_fill = yellow_fill
+        else:
+            row_fill = red_fill
+
+        for col, val in enumerate(values, 1):
+            cell = ws.cell(row=row_idx, column=col, value=val)
+            cell.fill = row_fill
+            cell.border = thin
+            cell.alignment = center if col != 1 else left
+            if col in [2, 3]:
+                cell.number_format = '#,##0.00'
+
+        ws.row_dimensions[row_idx].height = 20
+
+    # Summary rows
+    items = report.items
+    total_rows = len(items)
+    flagged = sum(1 for i in items if i.action == "FLAGGED" and i.status != "MATCH")
+    approved = sum(1 for i in items if i.action == "APPROVED")
+    matched = sum(1 for i in items if i.status == "MATCH")
+    flagged_amount = sum(
+        abs((i.invoiced_price or 0) - (i.quoted_price or 0))
+        for i in items if i.action == "FLAGGED" and i.status != "MATCH"
+    )
+
+    summary_row = total_rows + 5
+    ws.merge_cells(f"A{summary_row}:G{summary_row}")
+    ws[f"A{summary_row}"] = "SUMMARY"
+    ws[f"A{summary_row}"].font = Font(bold=True, name="Arial", color="FFFFFF")
+    ws[f"A{summary_row}"].fill = PatternFill("solid", start_color="1F2D3D")
+    ws[f"A{summary_row}"].alignment = center
+
+    summary_data = [
+        ("Total Items Reviewed", total_rows),
+        ("Matched Items", matched),
+        ("Flagged Items", flagged),
+        ("Approved Exceptions", approved),
+        ("Total Disputed Amount (₹)", f"₹{flagged_amount:,.2f}"),
+    ]
+    for i, (label, val) in enumerate(summary_data):
+        r = summary_row + 1 + i
+        ws.cell(row=r, column=1, value=label).font = Font(bold=True, name="Arial")
+        ws.cell(row=r, column=2, value=val)
+        ws.cell(row=r, column=1).border = thin
+        ws.cell(row=r, column=2).border = thin
+
+    # Column widths
+    col_widths = [40, 18, 18, 20, 45, 14, 40]
+    for i, width in enumerate(col_widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = width
+
+    # Save
+    os.makedirs("data/exports", exist_ok=True)
+    path = f"data/exports/audit_report_{report_id}.xlsx"
+    wb.save(path)
+
+    return FileResponse(
+        path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=f"Gidr_Audit_Report_{report_id}.xlsx"
+    )
+
+
+@app.get("/audit/list")
+async def list_audits(
+    db: Session = Depends(get_db),
+    current_user_id: int = Depends(get_current_user)
+):
+
+    reports = db.query(AuditReport).filter(
+        AuditReport.user_id == current_user_id
+    ).order_by(AuditReport.id.desc()).all()
+    return [
+        {
+            "id": r.id,
+            "quote_filename": r.quote_filename,
+            "invoice_filename": r.invoice_filename,
+            "created_at": r.created_at.isoformat(),
+            "item_count": len(r.items)
+        }
+        for r in reports
+    ]
 
 
 if __name__ == "__main__":

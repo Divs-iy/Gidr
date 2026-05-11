@@ -206,7 +206,8 @@ OUTPUT FORMAT:
                     model="meta-llama/llama-4-scout-17b-16e-instruct",  # ✅ Groq vision model
                     temperature=0.0,
                     response_format={"type": "json_object"},
-                    max_tokens=1000
+                    max_tokens=2000,
+                    seed=42
                 )
 
             # ✅ Text fallback path (if somehow only raw_text is available)
@@ -217,7 +218,8 @@ OUTPUT FORMAT:
                     model="llama-3.1-8b-instant",
                     temperature=0.0,
                     response_format={"type": "json_object"},
-                    max_tokens=1000
+                    max_tokens=2000,
+                    seed=42
                 )
 
             content = response.choices[0].message.content

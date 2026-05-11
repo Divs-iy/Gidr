@@ -52,6 +52,28 @@ class User(Base):
     email = Column(String, unique=True, index=True)
     hashed_password = Column(String)
 
+class AuditReport(Base):
+    __tablename__ = "audit_reports"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, nullable=False)
+    quote_filename = Column(String)
+    invoice_filename = Column(String)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    items = relationship("AuditItem", back_populates="report", cascade="all, delete-orphan")
+
+class AuditItem(Base):
+    __tablename__ = "audit_items"
+    id = Column(Integer, primary_key=True, index=True)
+    report_id = Column(Integer, ForeignKey("audit_reports.id"))
+    description = Column(String)
+    quoted_price = Column(Float)
+    invoiced_price = Column(Float)
+    status = Column(String)        # MATCH, PRICE MISMATCH, NOT IN QUOTE
+    reason = Column(String)        # auto-generated reason
+    action = Column(String)        # FLAGGED or APPROVED
+    comment = Column(String)       # accountant's note
+    report = relationship("AuditReport", back_populates="items")
+
 
 def init_db():
     Base.metadata.create_all(bind=engine)
