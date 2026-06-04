@@ -238,3 +238,105 @@ OUTPUT FORMAT:
                 "terms_and_conditions": "",
                 "confidence_score": 0.0
             }
+        
+    def _build_smart_prompt(self) -> str:
+        return """You are an intelligent document analyzer. Your job is to:
+1. Identify what type of document this is
+2. Extract ALL important information in the best structured format
+
+DOCUMENT TYPES you may encounter:
+- CONTRACT / AGREEMENT (performance, service, employment, vendor)
+- INVOICE / BILL
+- BOQ (Bill of Quantities)
+- INSURANCE POLICY
+- PURCHASE ORDER
+- RECEIPT
+- OTHER (describe what it is)
+
+EXTRACTION RULES:
+- Only extract what is EXPLICITLY visible. Never invent or guess.
+- For contracts: extract all parties, dates, fees, payment terms, and every section's key points
+- For invoices: extract vendor, line items, totals
+- For any document: capture ALL terms, conditions, obligations and clauses
+- Keep section summaries concise but complete — max 3 sentences per section
+- confidence_score = how clearly readable the document is (0.0 to 1.0)
+
+OUTPUT — return ONLY this JSON, no markdown, no explanation:
+{
+    "document_type": "",
+    "title": "",
+    "confidence": 0.0,
+    "key_fields": [
+        {"label": "", "value": ""}
+    ],
+    "sections_found": [],
+    "parties": {
+        "party_a": {"name": "", "role": "", "location": ""},
+        "party_b": {"name": "", "role": "", "location": ""}
+    },
+    "dates": {
+        "agreement_date": "",
+        "start_date": "",
+        "end_date": "",
+        "other_dates": []
+    },
+    "financials": {
+        "total_amount": 0.0,
+        "currency": "",
+        "payment_schedule": [],
+        "fee_breakdown": [
+            {"item": "", "quantity": 1, "unit_price": 0.0, "total": 0.0}
+        ]
+    },
+    "sections": [
+        {"section_number": "", "title": "", "summary": "", "key_points": []}
+    ],
+    "terms_and_conditions": [
+        {"category": "", "condition": ""}
+    ],
+    "cancellation_policy": "",
+    "governing_law": "",
+    "signatures": []
+}"""
+
+    def extract_smart(self, ocr_data: any) -> dict:
+        try:
+            images_b64 = []
+            if isinstance(ocr_data, dict):
+                images_b64 = ocr_data.get("images_b64", [])
+
+            if not images_b64:
+                return {"error": "No image data found"}
+
+            pages_to_send = images_b64[:4]
+
+            content = [{"type": "text", "text": self._build_smart_prompt()}]
+            for img_b64 in pages_to_send:
+                content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{img_b64}"}
+            })
+
+            response = self.client.chat.completions.create(
+                messages=[{"role": "user", "content": content}],
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            temperature=0.0,
+            response_format={"type": "json_object"},
+            max_tokens=3000,
+            seed=42
+        )
+
+            content_str = response.choices[0].message.content
+            return json.loads(content_str)
+
+        except Exception as e:
+            print(f"Smart Extraction Error: {e}")
+            return {
+            "document_type": "ERROR",
+            "title": "Could not extract",
+            "confidence": 0.0,
+            "key_fields": [],
+            "sections": [],
+            "terms_and_conditions": [],
+            "financials": {"total_amount": 0.0, "fee_breakdown": []}
+        }

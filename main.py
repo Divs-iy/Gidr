@@ -1,6 +1,7 @@
 # ✅ CORRECT STRUCTURE
 
 # --- 1. IMPORTS (no duplicates) ---
+import re
 import os, json, shutil, logging
 from database import get_db, init_db, InvoiceRecord, LineItem, User
 #from huggingface_hub import User
@@ -249,6 +250,7 @@ async def upload_invoice(
                 os.makedirs("data/raw_archive", exist_ok=True)
                 shutil.copy(temp_path, archive_path)
             os.remove(temp_path)
+
 @app.post("/compare")
 async def compare_docs(
     invoice: UploadFile = File(...),
@@ -622,6 +624,157 @@ async def list_audits(
         for r in reports
     ]
 
+@app.post("/upload/smart")
+async def upload_smart(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user_id: int = Depends(get_current_user)
+):
+    logger.info(f"Smart upload: {file.filename}")
+    if not file.filename.lower().endswith(('.png', '.jpg', '.jpeg', '.pdf')):
+        raise HTTPException(status_code=400, detail="Invalid file type.")
 
+    temp_path = f"data/raw/{file.filename}"
+    os.makedirs("data/raw", exist_ok=True)
+
+    with open(temp_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    try:
+        loop = asyncio.get_event_loop()
+
+        def run_smart_pipeline():
+            ocr_results = ocr_engine.run_ocr(temp_path)
+            return extractor_engine.extract_smart(ocr_results)
+
+        extracted = await loop.run_in_executor(executor, run_smart_pipeline)
+
+        # Build Excel — two sheets
+        os.makedirs("data/exports", exist_ok=True)
+        os.makedirs("data/raw", exist_ok=True)
+        doc_type = extracted.get("document_type", "DOCUMENT")
+        safe_type = re.sub(r'[^a-z0-9_]', '', doc_type.lower().replace(' ', '_').replace('/', '_'))
+        file_name = f"smart_{safe_type}_{datetime.now().strftime('%H%M%S')}.xlsx"
+        export_path = os.path.join("data", "exports", file_name)
+        with pd.ExcelWriter(export_path, engine="openpyxl") as writer:
+
+            # Sheet 1: Summary — key fields + parties + dates + financials
+            summary_rows = []
+
+            # Parties
+            parties = extracted.get("parties", {})
+            for role, party in parties.items():
+                if party.get("name"):
+                    summary_rows.append({
+                        "Category": "Party",
+                        "Field": party.get("role") or role,
+                        "Value": f"{party.get('name')} — {party.get('location', '')}"
+                    })
+
+            # Dates
+            dates = extracted.get("dates", {})
+            for label, val in dates.items():
+                if val and label != "other_dates":
+                    summary_rows.append({
+                        "Category": "Date",
+                        "Field": label.replace("_", " ").title(),
+                        "Value": val
+                    })
+            for d in dates.get("other_dates", []):
+                if d:
+                    val = " | ".join(f"{k}: {v}" for k, v in d.items()) if isinstance(d, dict) else str(d)
+                    summary_rows.append({"Category": "Date", "Field": "Other", "Value": val})
+
+            # Key fields
+            for kf in extracted.get("key_fields", []):
+                summary_rows.append({
+                    "Category": "Key Info",
+                    "Field": kf.get("label"),
+                    "Value": kf.get("value")
+                })
+
+            # Financials
+            fin = extracted.get("financials", {})
+            if fin.get("total_amount"):
+                summary_rows.append({
+                    "Category": "Financial",
+                    "Field": "Total Amount",
+                    "Value": f"{fin.get('currency', '')} {fin.get('total_amount', 0)}"
+                })
+            for ps in fin.get("payment_schedule", []):
+                if isinstance(ps, dict):
+                    val = " | ".join(f"{k}: {v}" for k, v in ps.items())
+                else:
+                    val = str(ps)
+                summary_rows.append({
+                "Category": "Payment Schedule",
+                "Field": "",
+                "Value": val
+                })
+
+            # Misc
+            if extracted.get("cancellation_policy"):
+                summary_rows.append({
+                    "Category": "Cancellation",
+                    "Field": "Policy",
+                    "Value": extracted.get("cancellation_policy")
+                })
+            if extracted.get("governing_law"):
+                summary_rows.append({
+                    "Category": "Legal",
+                    "Field": "Governing Law",
+                    "Value": extracted.get("governing_law")
+                })
+
+            pd.DataFrame(summary_rows).to_excel(writer, sheet_name="Summary", index=False)
+
+            # Sheet 2: Fee Breakdown
+            fee_rows = fin.get("fee_breakdown", [])
+            if fee_rows:
+                pd.DataFrame(fee_rows).to_excel(writer, sheet_name="Fee Breakdown", index=False)
+
+            # Sheet 3: Sections & T&C
+            tc_rows = []
+            for section in extracted.get("sections", []):
+                tc_rows.append({
+                    "Section": f"{section.get('section_number', '')} {section.get('title', '')}".strip(),
+                    "Summary": section.get("summary", ""),
+                    "Key Points": " | ".join(section.get("key_points", []))
+                })
+            for tc in extracted.get("terms_and_conditions", []):
+                tc_rows.append({
+                    "Section": tc.get("category", "Terms"),
+                    "Summary": tc.get("condition", ""),
+                    "Key Points": ""
+                })
+            if tc_rows:
+                pd.DataFrame(tc_rows).to_excel(writer, sheet_name="Sections & Terms", index=False)
+
+        BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "http://localhost:8000")
+        download_url = f"{BASE_URL}/downloads/{file_name}"
+
+        return {
+            "status": "success",
+            "document_type": doc_type,
+            "download_url": download_url,
+            "summary": {
+                "document_type": doc_type,
+                "title": extracted.get("title", file.filename),
+                "confidence": extracted.get("confidence", 0.0),
+                "key_fields": extracted.get("key_fields", []),
+                "sections_found": [
+                    f"{s.get('section_number', '')} {s.get('title', '')}".strip()
+                    for s in extracted.get("sections", [])
+                ]
+            }
+        }
+
+    except Exception as e:
+        logger.error(f"Smart upload error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 if __name__ == "__main__":
     uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=False)
