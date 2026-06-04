@@ -6,11 +6,11 @@
 Gidr is a full-stack web application designed to streamline accounts payable workflows. It leverages AI-driven OCR (Optical Character Recognition) to extract data from invoices and compare them against quotes with high precision.
 
 🚀 Live Demo
-Live Demo: [https://gidr-frontend-h9suzbxgw-divyas-projects-cf497612.vercel.app]
+Live Demo: [https://gidr-frontend.vercel.app]
 
 Backend API: (https://gidr.onrender.com)/docs
 
-✨ Features
+** Features**
 User Authentication: Secure Sign-in/Sign-up flow with JWT (JSON Web Tokens).
 
 AI Extraction: Uses PaddleOCR and Groq Vision to extract line items, vendor details, and totals from images/PDFs.
@@ -20,6 +20,34 @@ Intelligent Comparison: Compares extracted invoice data against uploaded quotes 
 Export to Excel: Generates downloadable .xlsx reports of extracted data.
 
 Invoice History: A dashboard to view, edit, and manage previously processed documents.
+
+##  Smart Document Extract
+
+Upload **any** document — invoice, contract, agreement, BOQ, insurance policy, purchase order — and the AI automatically detects the document type and extracts everything into a structured Excel file.
+
+### How it works
+1. Go to **New Upload** → switch to **Smart Extract ✨** tab
+2. Upload any PDF or image
+3. AI detects document type and extracts all relevant fields
+4. Download the generated Excel with up to 3 sheets:
+   - **Summary** — parties, dates, key info, financials, payment schedule
+   - **Fee Breakdown** — itemized costs
+   - **Sections & Terms** — every section summarized with key points
+
+### Supported document types
+- Contracts & Agreements (performance, service, vendor, employment)
+- Invoices & Bills
+- BOQ (Bill of Quantities)
+- Insurance Policies
+- Purchase Orders
+- Receipts
+- Any other structured document
+
+### Notes
+- Max file size: 10MB
+- Supported formats: PDF, PNG, JPG, JPEG
+- Multi-page documents supported (up to 4 pages processed)
+- All extracted data is private to your account
 
 🛠️ Technical Stack
 Frontend
