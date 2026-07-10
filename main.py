@@ -25,6 +25,15 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from database import AuditReport, AuditItem
+import asyncio
+from services.hindsight_service import (
+    store_invoice_memory,
+    check_duplicate_invoice,
+    check_vendor_anomaly,
+    store_discrepancy_pattern,
+    query_vendor_intelligence
+)
+ 
 # --- PATCH START ---
 import bcrypt
 # Passlib looks for __about__, so we give it what it wants
@@ -176,6 +185,33 @@ async def upload_invoice(
 
         extracted = await loop.run_in_executor(executor, run_pipeline)
 
+# ── Guard: only run Hindsight checks on successful extraction ──
+        vendor_name_check = extracted.get("vendor_name")
+        extraction_ok = vendor_name_check not in (None, "", "Unknown", "Could not extract", "ERROR")
+
+        if extraction_ok:
+            duplicate_check = await loop.run_in_executor(
+                executor,
+                lambda: check_duplicate_invoice(
+                user_id=current_user_id,
+                vendor_name=extracted.get("vendor_name", "Unknown"),
+                invoice_number=extracted.get("invoice_number", "N/A"),
+                total_amount=extracted.get("total_amount", 0.0)
+        )
+    )
+            anomaly_check = await loop.run_in_executor(
+                executor,
+                lambda: check_vendor_anomaly(
+            user_id=current_user_id,
+            vendor_name=extracted.get("vendor_name", "Unknown"),
+            total_amount=extracted.get("total_amount", 0.0),
+            line_items=extracted.get("line_items", [])
+        )
+    )
+        else:
+            duplicate_check = {"is_duplicate": False, "reason": "", "original_date": None}
+            anomaly_check = {"has_anomaly": False, "alerts": [], "history_count": 0}
+            logger.warning(f"Extraction failed for {file.filename} — skipping Hindsight checks")
         base_name = os.path.splitext(file.filename)[0]
         save_processed_json(base_name, extracted)
 
@@ -226,6 +262,28 @@ async def upload_invoice(
                     amount=item.get("amount")
                 ))
             db.commit()
+            # ── Store in Hindsight only if extraction succeeded ──
+            if extraction_ok:
+                store_invoice_memory(
+        user_id=current_user_id,
+        vendor_name=extracted.get("vendor_name", "Unknown"),
+        invoice_number=extracted.get("invoice_number", "N/A"),
+        total_amount=extracted.get("total_amount", 0.0),
+        date=extracted.get("date"),
+        line_items=extracted.get("line_items", [])
+    )
+             
+            await loop.run_in_executor(
+                executor,
+                lambda: store_invoice_memory(
+                    user_id=current_user_id,
+                    vendor_name=extracted.get("vendor_name", "Unknown"),
+                    invoice_number=extracted.get("invoice_number", "N/A"),
+                    total_amount=extracted.get("total_amount", 0.0),
+                    date=extracted.get("date"),
+                    line_items=extracted.get("line_items", [])
+                )
+            )
 
         # ✅ Always return regardless of source
         return {
@@ -234,6 +292,8 @@ async def upload_invoice(
             "saved_as": base_name,
             "download_url": download_url,
             "extracted_data": extracted,
+            "duplicate_alert": duplicate_check,      # ← NEW
+            "anomaly_alert": anomaly_check, 
             # "record_id": new_record.id if new_record else None
         }
 
@@ -320,6 +380,13 @@ async def compare_docs(
                     "invoice": "MISSING",
                     "diff": q_val
                 })
+        if discrepancies:
+            store_discrepancy_pattern(
+                user_id=1,
+                vendor_name=invoice_data.get("vendor_name", "Unknown"),
+                discrepancies=discrepancies,
+                invoice_number=invoice_data.get("invoice_number", "N/A")
+            )
             # amount matched — no discrepancy, skip
 
         return {
@@ -623,6 +690,25 @@ async def list_audits(
         }
         for r in reports
     ]
+
+@app.post("/vendor-intelligence/ask")
+async def ask_vendor_intelligence(
+    payload: dict = Body(...),
+    current_user_id: int = Depends(get_current_user)
+):
+    question = payload.get("question", "")
+    vendor_name = payload.get("vendor_name")  # optional
+ 
+    if not question:
+        raise HTTPException(status_code=400, detail="Question is required")
+ 
+    answer = query_vendor_intelligence(
+        user_id=current_user_id,
+        question=question,
+        vendor_name=vendor_name
+    )
+    return {"question": question, "answer": answer}
+ 
 
 @app.post("/upload/smart")
 async def upload_smart(
