@@ -61,7 +61,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Gidr API")
-executor = ThreadPoolExecutor(max_workers=2)
+executor = ThreadPoolExecutor(max_workers=6)
 EXPORT_DIR = "data/exports"
 if not os.path.exists(EXPORT_DIR):
     os.makedirs(EXPORT_DIR, exist_ok=True)
@@ -190,24 +190,23 @@ async def upload_invoice(
         extraction_ok = vendor_name_check not in (None, "", "Unknown", "Could not extract", "ERROR")
 
         if extraction_ok:
-            duplicate_check = await loop.run_in_executor(
-                executor,
-                lambda: check_duplicate_invoice(
-                user_id=current_user_id,
-                vendor_name=extracted.get("vendor_name", "Unknown"),
-                invoice_number=extracted.get("invoice_number", "N/A"),
-                total_amount=extracted.get("total_amount", 0.0)
-        )
-    )
-            anomaly_check = await loop.run_in_executor(
-                executor,
-                lambda: check_vendor_anomaly(
+            try:
+                duplicate_check = await check_duplicate_invoice(
             user_id=current_user_id,
             vendor_name=extracted.get("vendor_name", "Unknown"),
-            total_amount=extracted.get("total_amount", 0.0),
-            line_items=extracted.get("line_items", [])
+            invoice_number=extracted.get("invoice_number", "N/A"),
+            total_amount=extracted.get("total_amount", 0.0)
         )
-    )
+                anomaly_check = await check_vendor_anomaly(
+                    user_id=current_user_id,
+                    vendor_name=extracted.get("vendor_name", "Unknown"),
+                    total_amount=extracted.get("total_amount", 0.0),
+                    line_items=extracted.get("line_items", [])
+        )
+            except Exception as e:
+                logger.warning(f"Hindsight checks skipped: {e}")
+                duplicate_check = {"is_duplicate": False, "reason": "", "original_date": None}
+                anomaly_check = {"has_anomaly": False, "alerts": [], "history_count": 0}
         else:
             duplicate_check = {"is_duplicate": False, "reason": "", "original_date": None}
             anomaly_check = {"has_anomaly": False, "alerts": [], "history_count": 0}
@@ -231,7 +230,9 @@ async def upload_invoice(
         if not rows:
             rows.append({"Note": "No line items found", **extracted})
         BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "http://localhost:8000")
-        file_name = f"invoice_{extracted.get('invoice_number', 'unknown')}_{datetime.now().strftime('%H%M%S')}.xlsx"
+        raw_invoice_num = str(extracted.get('invoice_number') or 'unknown')
+        safe_invoice_num = re.sub(r'[^a-zA-Z0-9_-]', '_', raw_invoice_num)
+        file_name = f"invoice_{safe_invoice_num}_{datetime.now().strftime('%H%M%S')}.xlsx"
         web_export_path = os.path.join("data", "exports", file_name)
         pd.DataFrame(rows).to_excel(web_export_path, index=False)
         download_url = f"{BASE_URL}/downloads/{file_name}"
@@ -264,7 +265,8 @@ async def upload_invoice(
             db.commit()
             # ── Store in Hindsight only if extraction succeeded ──
             if extraction_ok:
-                store_invoice_memory(
+                try:
+                    await store_invoice_memory(
         user_id=current_user_id,
         vendor_name=extracted.get("vendor_name", "Unknown"),
         invoice_number=extracted.get("invoice_number", "N/A"),
@@ -272,18 +274,8 @@ async def upload_invoice(
         date=extracted.get("date"),
         line_items=extracted.get("line_items", [])
     )
-             
-            await loop.run_in_executor(
-                executor,
-                lambda: store_invoice_memory(
-                    user_id=current_user_id,
-                    vendor_name=extracted.get("vendor_name", "Unknown"),
-                    invoice_number=extracted.get("invoice_number", "N/A"),
-                    total_amount=extracted.get("total_amount", 0.0),
-                    date=extracted.get("date"),
-                    line_items=extracted.get("line_items", [])
-                )
-            )
+                except Exception as e:
+                    logger.warning(f"Hindsight store skipped: {e}")
 
         # ✅ Always return regardless of source
         return {
@@ -381,12 +373,15 @@ async def compare_docs(
                     "diff": q_val
                 })
         if discrepancies:
-            store_discrepancy_pattern(
-                user_id=1,
-                vendor_name=invoice_data.get("vendor_name", "Unknown"),
-                discrepancies=discrepancies,
-                invoice_number=invoice_data.get("invoice_number", "N/A")
-            )
+            try:
+                await store_discrepancy_pattern(
+            user_id=1,
+            vendor_name=invoice_data.get("vendor_name", "Unknown"),
+            discrepancies=discrepancies,
+            invoice_number=invoice_data.get("invoice_number", "N/A")
+        )
+            except Exception as e:
+                logger.warning(f"Hindsight store skipped: {e}")
             # amount matched — no discrepancy, skip
 
         return {
@@ -697,17 +692,21 @@ async def ask_vendor_intelligence(
     current_user_id: int = Depends(get_current_user)
 ):
     question = payload.get("question", "")
-    vendor_name = payload.get("vendor_name")  # optional
- 
+    vendor_name = payload.get("vendor_name")
+
     if not question:
         raise HTTPException(status_code=400, detail="Question is required")
- 
-    answer = query_vendor_intelligence(
-        user_id=current_user_id,
-        question=question,
-        vendor_name=vendor_name
-    )
-    return {"question": question, "answer": answer}
+
+    try:
+        result = await query_vendor_intelligence(
+            user_id=current_user_id,
+            question=question,
+            vendor_name=vendor_name
+        )
+        return result
+    except Exception as e:
+        logger.error(f"Vendor intelligence error: {e}")
+        return {"answer": "Could not process request.", "model_used": None, "cost": None}
  
 
 @app.post("/upload/smart")
